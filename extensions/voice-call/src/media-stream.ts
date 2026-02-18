@@ -210,12 +210,17 @@ export class MediaStreamHandler {
   }
 
   private getStreamToken(request: IncomingMessage): string | undefined {
-    if (!request.url || !request.headers.host) {
+    if (!request.url) {
       return undefined;
     }
+    // VD-6: Token is embedded in the URL path as the last path segment.
+    // e.g., /voice/stream/{token} — Twilio strips query params but preserves the path.
     try {
-      const url = new URL(request.url, `http://${request.headers.host}`);
-      return url.searchParams.get("token") ?? undefined;
+      const host = request.headers.host || "localhost";
+      const url = new URL(request.url, `http://${host}`);
+      const pathParts = url.pathname.split("/").filter(Boolean);
+      const lastSegment = pathParts[pathParts.length - 1];
+      return lastSegment || undefined;
     } catch {
       return undefined;
     }

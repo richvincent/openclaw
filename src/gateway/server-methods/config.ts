@@ -1,5 +1,11 @@
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { DEFAULT_PROVIDER } from "../../agents/defaults.js";
+import {
+  buildConfiguredAllowlistKeys,
+  modelKey,
+  parseModelRef,
+} from "../../agents/model-selection.js";
 import { listChannelPlugins } from "../../channels/plugins/index.js";
 import {
   CONFIG_PATH,
@@ -12,6 +18,7 @@ import {
 } from "../../config/config.js";
 import { applyLegacyMigrations } from "../../config/legacy.js";
 import { applyMergePatch } from "../../config/merge-patch.js";
+import { resolveAuditLogPath } from "../../config/paths.js";
 import {
   redactConfigObject,
   redactConfigSnapshot,
@@ -25,6 +32,7 @@ import {
 } from "../../infra/restart-sentinel.js";
 import { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
 import { loadOpenClawPlugins } from "../../plugins/loader.js";
+import { AuditLogger } from "../audit.js";
 import {
   ErrorCodes,
   errorShape,
@@ -35,6 +43,62 @@ import {
   validateConfigSchemaParams,
   validateConfigSetParams,
 } from "../protocol/index.js";
+
+/**
+ * VD-7: Validate that the primary model in a config object is permitted by the
+ * agents.defaults.models allowlist (if one is configured).
+ *
+ * Returns null if the model is allowed (or no allowlist is set), or an error
+ * string describing the violation.
+ */
+function checkModelAllowlist(cfg: unknown): string | null {
+  const agentDefaults = (cfg as { agents?: { defaults?: unknown } })?.agents?.defaults as
+    | {
+        models?: Record<string, unknown>;
+        model?: { primary?: string } | string;
+      }
+    | undefined;
+
+  if (!agentDefaults) {
+    return null;
+  }
+
+  const allowlistKeys = buildConfiguredAllowlistKeys({
+    cfg: cfg as Parameters<typeof buildConfiguredAllowlistKeys>[0]["cfg"],
+    defaultProvider: DEFAULT_PROVIDER,
+  });
+
+  // No allowlist configured → allow any model
+  if (!allowlistKeys) {
+    return null;
+  }
+
+  // Resolve the primary model ref from the new config
+  const rawModel = agentDefaults.model;
+  const primaryRaw =
+    typeof rawModel === "string"
+      ? rawModel.trim()
+      : typeof rawModel === "object" && rawModel !== null
+        ? (rawModel.primary?.trim() ?? "")
+        : "";
+
+  if (!primaryRaw) {
+    return null;
+  } // No primary model set → nothing to enforce
+
+  const parsed = parseModelRef(primaryRaw, DEFAULT_PROVIDER);
+  if (!parsed) {
+    return `invalid model reference: "${primaryRaw}"`;
+  }
+
+  const key = modelKey(parsed.provider, parsed.model);
+  if (!allowlistKeys.has(key)) {
+    const allowed = [...allowlistKeys].join(", ");
+    return `model "${key}" is not in the agents.defaults.models allowlist. Allowed: ${allowed || "(none)"}`;
+  }
+
+  return null;
+}
 
 function resolveBaseHash(params: unknown): string | null {
   const raw = (params as { baseHash?: unknown })?.baseHash;
@@ -149,8 +213,27 @@ export const configHandlers: GatewayRequestHandlers = {
     });
     respond(true, schema, undefined);
   },
-  "config.set": async ({ params, respond }) => {
+  "config.set": async ({ params, respond, client }) => {
+    // Initialize audit logger (VD-2)
+    const cfg = loadConfig();
+    const auditLogger = new AuditLogger(resolveAuditLogPath(cfg));
+    const deviceId = client?.connect?.device?.id;
+    const clientIp: string | undefined = undefined; // not available in ConnectParams
+
     if (!validateConfigSetParams(params)) {
+      // Audit failed validation
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { validation_error: true },
+          success: false,
+          error: `invalid params: ${formatValidationErrors(validateConfigSetParams.errors)}`,
+        })
+        .catch(() => {}); // Don't fail request if audit fails
+
       respond(
         false,
         undefined,
@@ -163,10 +246,34 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     const snapshot = await readConfigFileSnapshot();
     if (!requireConfigBaseHash(params, snapshot, respond)) {
+      // Audit base hash failure
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { base_hash_error: true },
+          success: false,
+          error: "base hash mismatch or missing",
+        })
+        .catch(() => {});
       return;
     }
     const rawValue = (params as { raw?: unknown }).raw;
     if (typeof rawValue !== "string") {
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { raw_type_error: true },
+          success: false,
+          error: "raw (string) required",
+        })
+        .catch(() => {});
+
       respond(
         false,
         undefined,
@@ -176,11 +283,35 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     const parsedRes = parseConfigJson5(rawValue);
     if (!parsedRes.ok) {
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { parse_error: true },
+          success: false,
+          error: parsedRes.error,
+        })
+        .catch(() => {});
+
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, parsedRes.error));
       return;
     }
     const validated = validateConfigObjectWithPlugins(parsedRes.parsed);
     if (!validated.ok) {
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { validation_error: true, issues: validated.issues },
+          success: false,
+          error: "invalid config",
+        })
+        .catch(() => {});
+
       respond(
         false,
         undefined,
@@ -190,6 +321,27 @@ export const configHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+
+    // VD-7: Enforce model allowlist — reject config that sets a primary model
+    // outside the agents.defaults.models allowlist (if one is configured).
+    const modelAllowlistError = checkModelAllowlist(validated.config);
+    if (modelAllowlistError) {
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { model_allowlist_violation: true },
+          success: false,
+          error: modelAllowlistError,
+        })
+        .catch(() => {});
+
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, modelAllowlistError));
+      return;
+    }
+
     let restored: typeof validated.config;
     try {
       restored = restoreRedactedValues(
@@ -197,14 +349,47 @@ export const configHandlers: GatewayRequestHandlers = {
         snapshot.config,
       ) as typeof validated.config;
     } catch (err) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, String(err instanceof Error ? err.message : err)),
-      );
+      const errorMsg = String(err instanceof Error ? err.message : err);
+      await auditLogger
+        .log({
+          timestamp: new Date().toISOString(),
+          method: "config.set",
+          deviceId,
+          clientIp,
+          params: { restore_error: true },
+          success: false,
+          error: errorMsg,
+        })
+        .catch(() => {});
+
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, errorMsg));
       return;
     }
+
+    // Capture previous config for audit trail
+    const previousConfig = snapshot.config;
+
     await writeConfigFile(restored);
+
+    // Audit successful config.set (VD-2)
+    await auditLogger
+      .log({
+        timestamp: new Date().toISOString(),
+        method: "config.set",
+        deviceId,
+        clientIp,
+        params: {
+          changed_keys: Object.keys(restored).filter(
+            (key) =>
+              JSON.stringify((restored as Record<string, unknown>)[key]) !==
+              JSON.stringify((previousConfig as Record<string, unknown> | undefined)?.[key]),
+          ),
+        },
+        previous: previousConfig ? redactConfigObject(previousConfig) : undefined,
+        success: true,
+      })
+      .catch(() => {}); // Don't fail request if audit fails
+
     respond(
       true,
       {

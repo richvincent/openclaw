@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { WebhookContext } from "../types.js";
 import { TwilioProvider } from "./twilio.js";
 
-const STREAM_URL_PREFIX = "wss://example.ngrok.app/voice/stream?token=";
+// VD-6: Token is now embedded in path, not query param (Twilio strips query params).
+// URL format: wss://example.ngrok.app/voice/stream/{token}
+const STREAM_URL_PREFIX = "wss://example.ngrok.app/voice/stream/";
 
 function createProvider(): TwilioProvider {
   return new TwilioProvider(

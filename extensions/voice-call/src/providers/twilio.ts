@@ -416,10 +416,11 @@ export class TwilioProvider implements VoiceCallProvider {
     if (!baseUrl) {
       return null;
     }
+    // VD-6: Embed token in URL path instead of query param.
+    // Twilio strips query parameters from WebSocket URLs before connecting,
+    // so ?token=... would never reach the server. The path segment is preserved.
     const token = this.getStreamAuthToken(callSid);
-    const url = new URL(baseUrl);
-    url.searchParams.set("token", token);
-    return url.toString();
+    return `${baseUrl}/${token}`;
   }
 
   /**

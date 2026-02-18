@@ -253,6 +253,27 @@ export function resolveOAuthPath(
   return path.join(resolveOAuthDir(env, stateDir), OAUTH_FILENAME);
 }
 
+/**
+ * Audit log file path for Gateway write operations (VD-2).
+ * Can be overridden via OPENCLAW_AUDIT_LOG env var or config.gateway.auditLog.
+ * Default: $STATE_DIR/logs/audit.jsonl
+ */
+export function resolveAuditLogPath(
+  cfg?: OpenClawConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  stateDir: string = resolveStateDir(env, envHomedir(env)),
+): string {
+  const envOverride = env.OPENCLAW_AUDIT_LOG?.trim();
+  if (envOverride) {
+    return resolveUserPath(envOverride, env, envHomedir(env));
+  }
+  const configPath = (cfg as { gateway?: { auditLog?: string } })?.gateway?.auditLog;
+  if (configPath && typeof configPath === "string") {
+    return resolveUserPath(configPath, env, envHomedir(env));
+  }
+  return path.join(stateDir, "logs", "audit.jsonl");
+}
+
 export function resolveGatewayPort(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,

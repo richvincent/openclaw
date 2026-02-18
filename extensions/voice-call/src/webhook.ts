@@ -177,7 +177,12 @@ export class VoiceCallWebhookServer {
         this.server.on("upgrade", (request, socket, head) => {
           const url = new URL(request.url || "/", `http://${request.headers.host}`);
 
-          if (url.pathname === streamPath) {
+          // VD-6: Accept path-based token: /voice/stream/{token}
+          // The pathname is either exactly streamPath (legacy) or streamPath/{token}.
+          const pathMatch =
+            url.pathname === streamPath || url.pathname.startsWith(`${streamPath}/`);
+
+          if (pathMatch) {
             console.log("[voice-call] WebSocket upgrade for media stream");
             this.mediaStreamHandler?.handleUpgrade(request, socket, head);
           } else {
